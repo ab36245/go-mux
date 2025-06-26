@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+for i
+do
+	n="github.com/ab36245/$i"
+	r="../$i"
+	echo go mod edit -replace="$n=$r"
+	go mod edit -replace="$n=$r"
+done
+
+for i
+do
+	n="github.com/ab36245/$i"
+	echo go get "${n}"
+	go get "${n}"
+done
