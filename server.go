@@ -7,126 +7,166 @@ import (
 	"github.com/ab36245/go-websocket"
 )
 
-type Handler func(*Channel)
-
-func Server(ws websocket.Socket, handler Handler) {
+func NewServer(ws websocket.Socket, handler Handler) *Server {
 	input := make(chan []byte)
 	output := make(chan []byte)
-
-	go readSocket(ws, input)
-
 	readers := make(map[uint]chan []byte)
-loop:
-	for {
-		fmt.Printf("Server: reading\n")
-		select {
-		case bytes, ok := <-input:
-			if !ok {
-				fmt.Printf("Server: input channel is closed\n")
-				break loop
-			}
-			fmt.Printf("Server: input %d bytes\n", len(bytes))
-			id, bytes, err := readNumber(bytes)
-			if err != nil {
-				fmt.Printf("Server: invalid channel id: %s\n", err)
-				break loop
-			}
-			fmt.Printf("Server: channel id %d\n", id)
-			fmt.Printf("Server: bytes remaining %d\n", len(bytes))
-			if id == 0 {
-				fmt.Printf("Server: control channel\n")
-				if len(bytes) == 0 {
-					fmt.Printf("Server: empty control message\n")
-					break loop
-				}
-				cmd := bytes[0]
-				bytes = bytes[1:]
-				switch cmd {
-				case 0:
-					fmt.Printf("Server: add channel request\n")
-					chid, _, err := readNumber(bytes)
-					if err != nil {
-						fmt.Printf("Server: invalid add channel id: %s\n", err)
-						break loop
-					}
-					fmt.Printf("Server: add channel id %d\n", chid)
-					if chid == 0 {
-						fmt.Printf("Server: channel id %d is reserved\n", chid)
-						break loop
-					}
-					if _, ok := readers[chid]; ok {
-						fmt.Printf("Server: channel id %d is already in use\n", chid)
-						break loop
-					}
-					fmt.Printf("Server: adding channel %d\n", chid)
-					reader := make(chan []byte)
-					readers[chid] = reader
-					go func() {
-						ch := &Channel{
-							id:     chid,
-							reader: reader,
-							writer: output,
-						}
-						fmt.Printf("Server: calling handler\n")
-						handler(ch)
-						fmt.Printf("Server: handler has completed\n")
-						// TODO close reader channel?
-						delete(readers, chid)
-					}()
-				default:
-					fmt.Printf("Server: unknown control command\n")
-					break loop
-				}
-			} else if reader, ok := readers[id]; ok {
-				fmt.Printf("Server: reader channel\n")
-				reader <- bytes
-			} else {
-				fmt.Printf("Server: invalid channel\n")
-				break loop
-			}
-		case bytes, ok := <-output:
-			if !ok {
-				fmt.Printf("Server: output channel is closed\n")
-				break loop
-			}
-			fmt.Printf("Server: output %d bytes\n", len(bytes))
-			if err := writeSocket(ws, bytes); err != nil {
-				fmt.Printf("Server: error writing to socket: %s\n", err)
-				break loop
-			}
-		}
+	return &Server{
+		handler: handler,
+		input:   input,
+		output:  output,
+		readers: readers,
+		ws:      ws,
 	}
-	fmt.Printf("Server: shutting down connection\n")
-	for id, reader := range readers {
-		fmt.Printf("Server: closing channel %d reader\n", id)
-		close(reader)
-	}
-	ws.Close()
 }
 
-func readSocket(ws websocket.Socket, input chan<- []byte) {
-	fmt.Printf("readSocket: starting\n")
+type Server struct {
+	handler Handler
+	input   chan []byte
+	output  chan []byte
+	readers map[uint]chan []byte
+	ws      websocket.Socket
+	// mutex?
+}
+
+func (s *Server) Run() {
+	go s.doSocket()
+	go s.doInput()
+	s.doOutput()
+}
+
+func (s *Server) doSocket() {
+	m := "Server.doSocket"
+	fmt.Printf("%s: starting\n", m)
 	for {
-		msg, err := ws.Read()
+		msg, err := s.ws.Read()
 		if errors.Is(err, websocket.ClosedError) {
-			fmt.Printf("readSocket: client has closed socket\n")
+			fmt.Printf("%s: client has closed socket\n", m)
 			break
 		}
 		if err != nil {
-			fmt.Printf("readSocket: got a read error: %s\n", err)
+			fmt.Printf("%s: got a read error: %s\n", m, err)
 			break
 		}
 		if !msg.IsBinary() {
-			fmt.Printf("readSocket: can't handle %s messages\n", msg.Kind)
+			fmt.Printf("%s: can't handle %s messages\n", m, msg.Kind)
 			break
 		}
-		input <- msg.Data
+		fmt.Printf("%s: read message %s\n", m, msg)
+		s.input <- msg.Data
 	}
-	fmt.Printf("readSocket: closing input channel\n")
-	close(input)
+	fmt.Printf("%s: closing input channel\n", m)
+	close(s.input)
 }
 
-func writeSocket(ws websocket.Socket, bytes []byte) error {
-	fmt.Printf("writeSocket: writing %d bytes\n", len(bytes))
-	return ws.WriteBinary(bytes)
+func (s *Server) doInput() {
+	m := "Server.doInput"
+	fmt.Printf("%s: starting\n", m)
+	for {
+		fmt.Printf("%s: reading\n", m)
+		bytes, ok := <-s.input
+		if !ok {
+			fmt.Printf("%s: input channel is closed\n", m)
+			break
+		}
+		fmt.Printf("%s: input %d bytes\n", m, len(bytes))
+		id, bytes, err := readNumber(bytes)
+		if err != nil {
+			fmt.Printf("%s: invalid channel id: %s\n", m, err)
+			break
+		}
+		fmt.Printf("%s: channel id %d\n", m, id)
+		fmt.Printf("%s: bytes remaining %d\n", m, len(bytes))
+		if id == 0 {
+			fmt.Printf("%s: control channel\n", m)
+			s.doControl(bytes)
+		} else if reader, ok := s.readers[id]; ok {
+			fmt.Printf("%s: reader channel\n", m)
+			reader <- bytes
+		} else {
+			fmt.Printf("%s: invalid channel\n", m)
+			break
+		}
+	}
+	fmt.Printf("%s: shutting down connection\n", m)
+	for id, reader := range s.readers {
+		fmt.Printf("%s: closing channel %d reader\n", m, id)
+		close(reader)
+	}
+	fmt.Printf("%s: closing websocket\n", m)
+	s.ws.Close()
+}
+
+func (s *Server) doControl(bytes []byte) {
+	m := "Server.doControl"
+	if len(bytes) == 0 {
+		fmt.Printf("%s: empty control message\n", m)
+		return
+	}
+	cmd := bytes[0]
+	bytes = bytes[1:]
+	switch cmd {
+	case 0:
+		fmt.Printf("%s: add channel command\n", m)
+		s.doAddChannel(bytes)
+	default:
+		fmt.Printf("%s: unknown control command %d\n", m, cmd)
+	}
+}
+
+func (s *Server) doAddChannel(bytes []byte) {
+	m := "Server.doAddChannel"
+	chid, _, err := readNumber(bytes)
+	if err != nil {
+		fmt.Printf("%s: invalid add channel id: %s\n", m, err)
+		return
+	}
+	fmt.Printf("%s: add channel id %d\n", m, chid)
+	if chid == 0 {
+		fmt.Printf("%s: channel id %d is reserved\n", m, chid)
+		return
+	}
+	if _, ok := s.readers[chid]; ok {
+		fmt.Printf("%s: channel id %d is already in use\n", m, chid)
+		return
+	}
+	fmt.Printf("%s: adding channel %d\n", m, chid)
+	reader := make(chan []byte)
+	// lock
+	s.readers[chid] = reader
+	// unlock
+	go func() {
+		ch := &Channel{
+			id:     chid,
+			reader: reader,
+			writer: s.output,
+		}
+		fmt.Printf("%s: calling handler\n", m)
+		s.handler(ch)
+		fmt.Printf("%s: handler has completed\n", m)
+		// TODO close reader channel?
+		// lock
+		delete(s.readers, chid)
+		// unlock
+	}()
+}
+
+type Handler func(*Channel)
+
+func (s *Server) doOutput() {
+	m := "Server.doOutput"
+	fmt.Printf("%s: starting\n", m)
+	for {
+		bytes, ok := <-s.output
+		if !ok {
+			fmt.Printf("%s: output channel is closed\n", m)
+			break
+		}
+		fmt.Printf("%s: output %d bytes\n", m, len(bytes))
+		err := s.ws.WriteBinary(bytes)
+		if err != nil {
+			fmt.Printf("%s: error writing to socket: %s\n", m, err)
+			break
+		}
+	}
 }
