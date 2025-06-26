@@ -7,13 +7,13 @@ import (
 	"github.com/ab36245/go-websocket"
 )
 
+type Handler func(*Channel)
+
 func NewServer(ws websocket.Socket, handler Handler) *Server {
-	input := make(chan []byte)
 	output := make(chan []byte)
 	readers := make(map[uint]chan []byte)
 	return &Server{
 		handler: handler,
-		input:   input,
 		output:  output,
 		readers: readers,
 		ws:      ws,
@@ -21,8 +21,8 @@ func NewServer(ws websocket.Socket, handler Handler) *Server {
 }
 
 type Server struct {
+	closing bool
 	handler Handler
-	input   chan []byte
 	output  chan []byte
 	readers map[uint]chan []byte
 	ws      websocket.Socket
@@ -30,13 +30,12 @@ type Server struct {
 }
 
 func (s *Server) Run() {
-	go s.doSocket()
 	go s.doInput()
 	s.doOutput()
 }
 
-func (s *Server) doSocket() {
-	m := "Server.doSocket"
+func (s *Server) doInput() {
+	m := "Server.doInput"
 	fmt.Printf("%s: starting\n", m)
 	for {
 		msg, err := s.ws.Read()
@@ -53,24 +52,8 @@ func (s *Server) doSocket() {
 			break
 		}
 		fmt.Printf("%s: read message %s\n", m, msg)
-		s.input <- msg.Data
-	}
-	fmt.Printf("%s: closing input channel\n", m)
-	close(s.input)
-}
-
-func (s *Server) doInput() {
-	m := "Server.doInput"
-	fmt.Printf("%s: starting\n", m)
-	for {
-		fmt.Printf("%s: reading\n", m)
-		bytes, ok := <-s.input
-		if !ok {
-			fmt.Printf("%s: input channel is closed\n", m)
-			break
-		}
-		fmt.Printf("%s: input %d bytes\n", m, len(bytes))
-		id, bytes, err := readNumber(bytes)
+		fmt.Printf("%s: reading channel id\n", m)
+		id, bytes, err := readNumber(msg.Data)
 		if err != nil {
 			fmt.Printf("%s: invalid channel id: %s\n", m, err)
 			break
@@ -89,12 +72,11 @@ func (s *Server) doInput() {
 		}
 	}
 	fmt.Printf("%s: shutting down connection\n", m)
+	s.closing = true
 	for id, reader := range s.readers {
 		fmt.Printf("%s: closing channel %d reader\n", m, id)
 		close(reader)
 	}
-	fmt.Printf("%s: closing websocket\n", m)
-	s.ws.Close()
 }
 
 func (s *Server) doControl(bytes []byte) {
@@ -108,13 +90,13 @@ func (s *Server) doControl(bytes []byte) {
 	switch cmd {
 	case 0:
 		fmt.Printf("%s: add channel command\n", m)
-		s.doAddChannel(bytes)
+		s.doControlAddChannel(bytes)
 	default:
 		fmt.Printf("%s: unknown control command %d\n", m, cmd)
 	}
 }
 
-func (s *Server) doAddChannel(bytes []byte) {
+func (s *Server) doControlAddChannel(bytes []byte) {
 	m := "Server.doAddChannel"
 	chid, _, err := readNumber(bytes)
 	if err != nil {
@@ -148,10 +130,17 @@ func (s *Server) doAddChannel(bytes []byte) {
 		// lock
 		delete(s.readers, chid)
 		// unlock
+		fmt.Printf("%s: no. of channels remaining is %d\n", m, len(s.readers))
+		if len(s.readers) == 0 {
+			fmt.Printf("%s: no remaining channels\n", m)
+			fmt.Printf("%s: closing flag is %v\n", m, s.closing)
+			if s.closing {
+				fmt.Printf("%s: closing output channel\n", m)
+				close(s.output)
+			}
+		}
 	}()
 }
-
-type Handler func(*Channel)
 
 func (s *Server) doOutput() {
 	m := "Server.doOutput"
